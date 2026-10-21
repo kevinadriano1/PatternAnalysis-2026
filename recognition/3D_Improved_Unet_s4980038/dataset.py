@@ -311,3 +311,22 @@ class HipMRIVolumeDataset(Dataset[dict[str, object]]):
             "affine": torch.from_numpy(np.asarray(affine, dtype=np.float64)),
             "original_shape": torch.tensor(original_shape, dtype=torch.int64),
         }
+
+def parse_spatial_size(values: Sequence[int]) -> tuple[int, int, int]:
+    """Validate a command-line D H W triplet."""
+
+    if len(values) != 3:
+        raise ValueError("--spatial-size requires exactly D H W")
+    size = tuple(int(value) for value in values)
+    if any(value <= 0 or value % 16 != 0 for value in size):
+        raise ValueError("D, H, and W must be positive multiples of 16")
+    return size  # type: ignore[return-value]
+
+
+def patient_number(patient_id: str) -> int:
+    """Return the numeric part of a HipMRI patient identifier."""
+    
+    match = re.search(r"(\d+)$", patient_id)
+    if not match:
+        raise ValueError(f"Patient identifier has no numeric suffix: {patient_id}")
+    return int(match.group(1))
