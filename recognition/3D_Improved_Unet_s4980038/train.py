@@ -225,7 +225,7 @@ def save_history(history: list[dict[str, float]], output_dir: Path) -> None:
             linestyle="--",
             label="train total (with auxiliary)",
         )
-        
+
     axes[0].set(title="Segmentation and optimisation loss", xlabel="Epoch")
     axes[0].legend()
     axes[1].plot(epochs, [row["train_foreground_dice"] for row in history], label="train")
@@ -277,3 +277,212 @@ def profile_inference(
         "device": str(device),
         "gpu_model": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
     }
+
+def main() -> None:
+    """Main training loop for HipMRI segmentation."""
+
+    # Parse command line arguments and set up training environment
+    args = parse_args()
+    spatial_size = parse_spatial_size(args.spatial_size)
+    if args.epochs < 1 or args.batch_size < 1 or args.slice_batch_size < 1:
+        raise ValueError("Epoch and batch sizes must be positive")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    seed_everything(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = device.type == "cuda" and not args.no_amp
+
+    records = discover_cases(args.data_root)
+    orientation_audit = audit_orientations(records)
+    splits = split_cases(records, seed=args.seed)
+    save_split_manifest(splits, args.output_dir / "split_manifest.json")
+    if args.limit_cases is not None:
+        splits = {name: subset[: args.limit_cases] for name, subset in splits.items()}
+
+    # Create datasets and data loaders for training, validation, and testing
+    datasets = {
+        name: HipMRIVolumeDataset(
+            subset,
+            spatial_size=spatial_size,
+            augment=name == "train",
+        )
+        for name, subset in splits.items()
+    }
+    loaders = {
+        name: DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=name == "train",
+            num_workers=args.workers,
+            pin_memory=device.type == "cuda",
+            persistent_workers=args.workers > 0,
+        )
+        for name, dataset in datasets.items()
+    }
+
+    # Build the model, define the loss function, optimizer, and learning rate scheduler
+    model = build_model(args.model, len(LABEL_NAMES), args.base_channels).to(device)
+    # Rare OARs and prostate receive more influence than background/body.
+    weights = torch.tensor([0.05, 0.35, 1.0, 2.0, 2.0, 4.0], device=device)
+    criterion = DiceCrossEntropyLoss(weights, dice_weight=0.6)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
+
+    run_config = {
+        **vars(args),
+        "data_root": str(args.data_root.resolve()),
+        "output_dir": str(args.output_dir.resolve()),
+        "spatial_size": list(spatial_size),
+        "device": str(device),
+        "amp": amp_enabled,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "gpu_model": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "orientation_audit": orientation_audit,
+        "split_case_counts": {name: len(items) for name, items in splits.items()},
+        "split_patient_counts": {
+            name: len({item.patient_id for item in items}) for name, items in splits.items()
+        },
+    }
+    write_json(run_config, args.output_dir / "run_config.json")
+    print(json.dumps(run_config, indent=2), flush=True)
+
+    best_score = -1.0
+    epochs_without_improvement = 0
+    history: list[dict[str, float]] = []
+    checkpoint_path = args.output_dir / "best_model.pt"
+    peak_training_gpu_allocated_mib = 0.0
+
+    # Main training loop over epochs
+    for epoch in range(1, args.epochs + 1):
+        started = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        train_metrics = run_epoch(
+            model,
+            loaders["train"],
+            criterion,
+            device,
+            args.model,
+            args.slice_batch_size,
+            amp_enabled,
+            optimizer,
+            scaler,
+        )
+        epoch_training_peak_mib = (
+            torch.cuda.max_memory_allocated(device) / (1024**2)
+            if device.type == "cuda"
+            else 0.0
+        )
+        peak_training_gpu_allocated_mib = max(
+            peak_training_gpu_allocated_mib, epoch_training_peak_mib
+        )
+        validation_metrics = run_epoch(
+            model,
+            loaders["validation"],
+            criterion,
+            device,
+            args.model,
+            args.slice_batch_size,
+            amp_enabled,
+        )
+        scheduler.step()
+        row = {
+            "epoch": float(epoch),
+            "train_main_loss": float(train_metrics["main_loss"]),
+            "validation_main_loss": float(validation_metrics["main_loss"]),
+            "train_optimization_loss": float(train_metrics["optimization_loss"]),
+            "validation_optimization_loss": float(
+                validation_metrics["optimization_loss"]
+            ),
+            "train_foreground_dice": float(train_metrics["mean_foreground_dice"]),
+            "validation_foreground_dice": float(validation_metrics["mean_foreground_dice"]),
+            "training_peak_gpu_allocated_mib": epoch_training_peak_mib,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "seconds": time.perf_counter() - started,
+        }
+        history.append(row)
+        print(json.dumps(row), flush=True)
+
+        score = row["validation_foreground_dice"]
+        if score > best_score:
+            best_score = score
+            epochs_without_improvement = 0
+            torch.save(
+                {
+                    "model_name": args.model,
+                    "model_state": model.state_dict(),
+                    "num_classes": len(LABEL_NAMES),
+                    "base_channels": args.base_channels,
+                    "spatial_size": list(spatial_size),
+                    "seed": args.seed,
+                    "label_names": list(LABEL_NAMES),
+                    "best_validation_foreground_dice": best_score,
+                    "peak_training_gpu_allocated_mib": peak_training_gpu_allocated_mib,
+                    "gpu_model": (
+                        torch.cuda.get_device_name(device) if device.type == "cuda" else None
+                    ),
+                },
+                checkpoint_path,
+            )
+        else:
+            epochs_without_improvement += 1
+        if epochs_without_improvement >= args.patience:
+            print(f"Early stopping after {epoch} epochs", flush=True)
+            break
+
+    # Save training history, best model checkpoint, and test metrics
+    save_history(history, args.output_dir)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint["peak_training_gpu_allocated_mib"] = peak_training_gpu_allocated_mib
+    checkpoint["gpu_model"] = (
+        torch.cuda.get_device_name(device) if device.type == "cuda" else None
+    )
+    
+    torch.save(checkpoint, checkpoint_path)
+    training_summary = {
+        "model": args.model,
+        "epochs_completed": len(history),
+        "best_validation_foreground_dice": best_score,
+        "peak_training_gpu_allocated_mib": peak_training_gpu_allocated_mib,
+        "gpu_model": checkpoint["gpu_model"],
+        "device": str(device),
+        "memory_definition": "Peak PyTorch GPU memory allocated during a training epoch",
+    }
+    write_json(training_summary, args.output_dir / "training_summary.json")
+    model.load_state_dict(checkpoint["model_state"])
+    test_metrics = run_epoch(
+        model,
+        loaders["test"],
+        criterion,
+        device,
+        args.model,
+        args.slice_batch_size,
+        amp_enabled,
+    )
+
+    test_metrics["labels"] = list(LABEL_NAMES)
+    test_metrics["resources"] = profile_inference(
+        model,
+        loaders["test"],
+        device,
+        args.model,
+        args.slice_batch_size,
+        amp_enabled,
+    )
+
+    test_metrics["resources"][
+        "peak_training_gpu_allocated_mib"
+    ] = peak_training_gpu_allocated_mib
+    write_json(test_metrics, args.output_dir / "test_metrics.json")
+    print(json.dumps(test_metrics, indent=2), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Training interrupted", file=sys.stderr)
+        raise SystemExit(130)
