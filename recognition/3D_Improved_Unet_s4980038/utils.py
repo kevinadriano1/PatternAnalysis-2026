@@ -63,3 +63,73 @@ class SegmentationMetrics:
             "mean_foreground_dice": dice[1:].mean().item(),
             "mean_foreground_iou": iou[1:].mean().item(),
         }
+
+
+class BoundaryF1:
+    """Tolerance-aware boundary F1 accumulator for a selected label.
+
+    ``tolerance`` is a Chebyshev distance in voxels on the evaluated tensor
+    grid, not millimetres.  With the default downsampled D,H,W shape, one voxel
+    represents the resized grid spacing and may differ physically by case.
+    """
+
+    def __init__(self, label: int = 5, tolerance: int = 1) -> None:
+        if not isinstance(tolerance, int) or tolerance < 0:
+            raise ValueError("Boundary tolerance must be a non-negative integer")
+        self.label = label
+        self.tolerance = tolerance
+        self.matched_prediction = 0.0
+        self.prediction_boundary = 0.0
+        self.matched_target = 0.0
+        self.target_boundary = 0.0
+
+    @staticmethod
+    def _boundary(mask: torch.Tensor) -> torch.Tensor:
+
+        # Erode the mask and subtract it from the original to get the boundary voxels
+        mask = mask.float().unsqueeze(1)
+        if mask.ndim == 5:
+            eroded = 1.0 - F.max_pool3d(1.0 - mask, 3, stride=1, padding=1)
+        elif mask.ndim == 4:
+            eroded = 1.0 - F.max_pool2d(1.0 - mask, 3, stride=1, padding=1)
+        else:
+            raise ValueError(f"Expected batched 2D or 3D mask, got {mask.shape}")
+        return (mask - eroded).clamp_min(0).bool()
+
+    def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
+        """Update the boundary F1 statistics with a new batch of predictions and targets."""
+
+        pred_boundary = self._boundary(prediction == self.label)
+        target_boundary = self._boundary(target == self.label)
+        kernel = 2 * self.tolerance + 1
+        if pred_boundary.ndim == 5:
+            dilated_pred = F.max_pool3d(
+                pred_boundary.float(), kernel, stride=1, padding=self.tolerance
+            ).bool()
+            dilated_target = F.max_pool3d(
+                target_boundary.float(), kernel, stride=1, padding=self.tolerance
+            ).bool()
+        else:
+            dilated_pred = F.max_pool2d(
+                pred_boundary.float(), kernel, stride=1, padding=self.tolerance
+            ).bool()
+            dilated_target = F.max_pool2d(
+                target_boundary.float(), kernel, stride=1, padding=self.tolerance
+            ).bool()
+
+        self.matched_prediction += (pred_boundary & dilated_target).sum().item()
+        self.prediction_boundary += pred_boundary.sum().item()
+        self.matched_target += (target_boundary & dilated_pred).sum().item()
+        self.target_boundary += target_boundary.sum().item()
+
+    def compute(self) -> dict[str, float]:
+        """Compute the boundary precision, recall, and F1 score."""
+        
+        precision = self.matched_prediction / max(self.prediction_boundary, 1.0)
+        recall = self.matched_target / max(self.target_boundary, 1.0)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        return {
+            "prostate_boundary_precision": precision,
+            "prostate_boundary_recall": recall,
+            "prostate_boundary_f1": f1,
+        }
