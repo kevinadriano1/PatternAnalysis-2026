@@ -230,3 +230,90 @@ class ImprovedUNet3D(nn.Module):
         ]
 
         return {"out": main_logits, "aux": auxiliary}
+
+
+class DiceCrossEntropyLoss(nn.Module):
+    """Combined cross-entropy and foreground soft Dice loss.
+
+    The multi-class soft Dice component is inspired by
+    Isensee et al. (2018), while this implementation combines
+    it with cross-entropy using configurable weighting.
+    """
+
+    def __init__(
+        self,
+        class_weights: torch.Tensor | None = None,
+        dice_weight: float = 0.6,
+        smooth: float = 1e-5,
+    ) -> None:
+        
+        super().__init__()
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights.float())
+        else:
+            self.class_weights = None
+        self.dice_weight = dice_weight
+        self.smooth = smooth
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute the combined loss for multi-class segmentation."""
+
+        ce = F.cross_entropy(logits, target.long(), weight=self.class_weights)
+        probabilities = logits.softmax(dim=1)
+        one_hot = F.one_hot(target.long(), logits.shape[1]).movedim(-1, 1).float()
+
+        dims = tuple(range(2, logits.ndim))
+        intersection = (probabilities * one_hot).sum(dim=dims)
+        denominator = probabilities.sum(dim=dims) + one_hot.sum(dim=dims)
+
+        # Compute the soft Dice coefficient for each class, excluding the background (class 0)
+        dice = (2.0 * intersection + self.smooth) / (denominator + self.smooth)
+        foreground_dice_loss = 1.0 - dice[:, 1:].mean()
+
+        return (1.0 - self.dice_weight) * ce + self.dice_weight * foreground_dice_loss
+
+
+def primary_logits(output: torch.Tensor | dict[str, object]) -> torch.Tensor:
+    """Return main logits from either architecture's forward result."""
+
+    if isinstance(output, dict):
+        logits = output["out"]
+        if not isinstance(logits, torch.Tensor):
+            raise TypeError("Model output 'out' must be a tensor")
+        return logits
+    return output
+
+
+def supervised_loss(
+    output: torch.Tensor | dict[str, object],
+    target: torch.Tensor,
+    criterion: nn.Module,
+    auxiliary_weights: tuple[float, ...] = (0.4, 0.2),
+) -> torch.Tensor:
+    """Apply the main loss and weighted deep-supervision losses when present."""
+
+    loss = criterion(primary_logits(output), target)
+
+    if isinstance(output, dict):
+        auxiliary = output.get("aux", [])
+        if not isinstance(auxiliary, list):
+            raise TypeError("Model output 'aux' must be a list")
+        for weight, logits in zip(auxiliary_weights, auxiliary):
+            loss = loss + weight * criterion(logits, target)
+
+    return loss
+
+
+def build_model(
+    name: str,
+    num_classes: int = 6,
+    base_channels: int | None = None,
+) -> nn.Module:
+    """Construct a supported model by command-line name."""
+
+    if name == "unet2d":
+        return UNet2D(num_classes=num_classes, base_channels=base_channels or 32)
+    if name == "improved_unet3d":
+        return ImprovedUNet3D(num_classes=num_classes, base_channels=base_channels or 16)
+    
+    raise ValueError(f"Unknown model: {name}")
