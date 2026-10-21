@@ -103,3 +103,96 @@ def _two_dimensional_step(
 
     prediction = torch.cat(predictions).reshape(batch, depth, height, width)
     return weighted_loss, weighted_loss, prediction
+
+
+def run_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    criterion: torch.nn.Module,
+    device: torch.device,
+    model_name: str,
+    slice_batch_size: int,
+    amp_enabled: bool,
+    optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+) -> dict[str, object]:
+    """Run one epoch of training or evaluation."""
+    
+    training = optimizer is not None
+    model.train(training)
+    metrics = SegmentationMetrics(len(LABEL_NAMES))
+    boundary = BoundaryF1(label=5, tolerance=1)
+    total_main_loss = 0.0
+    total_optimization_loss = 0.0
+    total_cases = 0
+
+    grad_context = torch.enable_grad() if training else torch.inference_mode()
+
+    with grad_context:
+        for batch in loader:
+            image, target = _move_batch(batch, device)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+
+            # Use different processing for 2D and 3D models
+            if model_name == "unet2d":
+                batch_main_loss, batch_optimization_loss, prediction = _two_dimensional_step(
+                    model,
+                    image,
+                    target,
+                    criterion,
+                    slice_batch_size,
+                    amp_enabled,
+                    scaler if training else None,
+                )
+
+            else:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=amp_enabled,
+                ):
+                    output = model(image)
+                    optimization_loss = supervised_loss(output, target, criterion)
+                    if training:
+                        # Reporting-only loss: detached so the optimisation
+                        # graph and deep-supervision objective are unchanged.
+                        main_loss = criterion(primary_logits(output).detach(), target)
+                    else:
+                        main_loss = optimization_loss
+
+                if training and scaler is not None:
+                    scaler.scale(optimization_loss).backward()
+
+                
+                batch_main_loss = main_loss.detach().item()
+                batch_optimization_loss = optimization_loss.detach().item()
+                prediction = primary_logits(output).detach().argmax(dim=1)
+
+            if training:
+                if scaler is None:
+                    raise RuntimeError("A gradient scaler is required during training")
+                scaler.step(optimizer)
+                scaler.update()
+
+            # Update metrics and accumulate losses
+            metrics.update(prediction, target)
+            if not training:
+                boundary.update(prediction, target)
+            cases = image.shape[0]
+            total_main_loss += batch_main_loss * cases
+            total_optimization_loss += batch_optimization_loss * cases
+            total_cases += cases
+
+    # Compute average losses and return results
+    main_loss = total_main_loss / max(total_cases, 1)
+    optimization_loss = total_optimization_loss / max(total_cases, 1)
+    result: dict[str, object] = {
+        "main_loss": main_loss,
+        "optimization_loss": optimization_loss,
+        "loss": main_loss,
+        **metrics.compute(),
+    }
+    if not training:
+        result.update(boundary.compute())
+    return result
