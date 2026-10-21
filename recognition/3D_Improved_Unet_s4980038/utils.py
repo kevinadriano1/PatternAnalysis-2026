@@ -263,3 +263,81 @@ def regional_prostate_dice(
         "worst_prostate_slice": worst_index,
         "worst_prostate_slice_dice": worst_score,
     }
+
+
+def infer_volume(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    model_name: str,
+    slice_batch_size: int = 16,
+    use_amp: bool = True,
+) -> torch.Tensor:
+    """Return class predictions in B,D,H,W for a 2D or 3D model."""
+
+    # Use automatic mixed precision for improved performance on CUDA devices, and handle different model types (3D Improved UNet and 2D UNet) accordingly.
+    if model_name == "improved_unet3d":
+        with torch.autocast(
+            device_type=image.device.type,
+            dtype=torch.float16,
+            enabled=use_amp and image.device.type == "cuda",
+        ):
+            logits = primary_logits(model(image))
+        return logits.argmax(dim=1)
+    if model_name != "unet2d":
+        raise ValueError(f"Unknown model: {model_name}")
+
+    # For 2D UNet, reshape the input image to process slices in batches, and accumulate predictions for the entire volume.
+    batch, channels, depth, height, width = image.shape
+    slices = image.permute(0, 2, 1, 3, 4).reshape(batch * depth, channels, height, width)
+    predictions: list[torch.Tensor] = []
+
+    # Process the slices in batches to avoid memory issues, using automatic mixed precision if enabled.
+    for start in range(0, slices.shape[0], slice_batch_size):
+        with torch.autocast(
+            device_type=image.device.type,
+            dtype=torch.float16,
+            enabled=use_amp and image.device.type == "cuda",
+        ):
+            logits = model(slices[start : start + slice_batch_size])
+        predictions.append(primary_logits(logits).argmax(dim=1))
+    stacked = torch.cat(predictions, dim=0)
+    return stacked.reshape(batch, depth, height, width)
+
+
+def timed_inference(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    model_name: str,
+    slice_batch_size: int,
+    use_amp: bool,
+) -> tuple[torch.Tensor, float]:
+    """Synchronise the GPU and measure whole-volume inference milliseconds."""
+
+    if image.device.type == "cuda":
+        torch.cuda.synchronize(image.device)
+    start = time.perf_counter()
+    prediction = infer_volume(model, image, model_name, slice_batch_size, use_amp)
+    if image.device.type == "cuda":
+        torch.cuda.synchronize(image.device)
+    return prediction, (time.perf_counter() - start) * 1000.0
+
+
+def parameter_count(model: torch.nn.Module) -> int:
+    # Return the total number of parameters in the model, including both trainable and non-trainable parameters.
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def write_json(payload: object, path: str | Path) -> None:
+    # Write a JSON payload to a file, creating parent directories if necessary.
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8")
+
+
+def mean_dicts(rows: Iterable[dict[str, float]], keys: Iterable[str]) -> dict[str, float]:
+    # Compute the mean of specified keys across a list of dictionaries, returning NaN for keys with no valid entries.
+    rows = list(rows)
+    return {
+        key: float(np.nanmean([row[key] for row in rows])) if rows else float("nan")
+        for key in keys
+    }
