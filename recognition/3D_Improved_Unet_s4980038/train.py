@@ -196,3 +196,84 @@ def run_epoch(
     if not training:
         result.update(boundary.compute())
     return result
+
+
+def save_history(history: list[dict[str, float]], output_dir: Path) -> None:
+    """Save training history to CSV and plot training curves."""
+
+    fieldnames = list(history[0])
+    with (output_dir / "history.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
+
+    epochs = [row["epoch"] for row in history]
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+    axes[0].plot(epochs, [row["train_main_loss"] for row in history], label="train main")
+    axes[0].plot(
+        epochs,
+        [row["validation_main_loss"] for row in history],
+        label="validation main",
+    )
+    if any(
+        abs(row["train_optimization_loss"] - row["train_main_loss"]) > 1e-8
+        for row in history
+    ):
+        axes[0].plot(
+            epochs,
+            [row["train_optimization_loss"] for row in history],
+            linestyle="--",
+            label="train total (with auxiliary)",
+        )
+        
+    axes[0].set(title="Segmentation and optimisation loss", xlabel="Epoch")
+    axes[0].legend()
+    axes[1].plot(epochs, [row["train_foreground_dice"] for row in history], label="train")
+    axes[1].plot(epochs, [row["validation_foreground_dice"] for row in history], label="validation")
+    axes[1].set(title="Mean foreground Dice", xlabel="Epoch", ylim=(0, 1))
+    axes[1].legend()
+    figure.tight_layout()
+    figure.savefig(output_dir / "training_curves.png", dpi=180)
+    plt.close(figure)
+
+
+def profile_inference(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    model_name: str,
+    slice_batch_size: int,
+    amp_enabled: bool,
+) -> dict[str, float | int | str]:
+    """Profile model inference performance."""
+
+    model.eval()
+    timings: list[float] = []
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    with torch.inference_mode():
+        for batch_index, batch in enumerate(loader):
+            image, _ = _move_batch(batch, device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            _ = infer_volume(model, image, model_name, slice_batch_size, amp_enabled)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = (time.perf_counter() - start) * 1000.0 / image.shape[0]
+            if batch_index > 0:  # discard first case as a kernel warm-up
+                timings.append(elapsed)
+    peak_mb = (
+        torch.cuda.max_memory_allocated(device) / (1024**2) if device.type == "cuda" else 0.0
+    )
+
+    return {
+        "parameters": parameter_count(model),
+        "mean_inference_ms_per_case": sum(timings) / max(len(timings), 1),
+        "peak_inference_gpu_allocated_mib": peak_mb,
+        "peak_gpu_vram_mb": peak_mb,
+        "device": str(device),
+        "gpu_model": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+    }
