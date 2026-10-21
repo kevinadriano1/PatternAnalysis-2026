@@ -238,3 +238,76 @@ def _validate_alignment(
     
     if unique.min(initial=0) < 0 or unique.max(initial=0) >= len(LABEL_NAMES):
         raise ValueError(f"Unexpected labels {unique.tolist()} in {record.label_path}")
+
+
+class HipMRIVolumeDataset(Dataset[dict[str, object]]):
+    """Lazy volume dataset shared by both 2D and 3D experiments.
+
+    The 2D training code flattens the downsampled depth dimension into axial
+    slices.  This makes both models consume identical patients, cases,
+    normalisation, spatial resolution, and held-out test data.
+    """
+
+    def __init__(
+        self,
+        records: Sequence[VolumeRecord],
+        spatial_size: tuple[int, int, int] = (64, 128, 128),
+        augment: bool = False,
+    ) -> None:
+        
+        self.records = list(records)
+        self.spatial_size = spatial_size
+        self.augment = augment
+        if not self.records:
+            raise ValueError("Dataset received no volume records")
+        if any(size <= 0 for size in spatial_size):
+            raise ValueError("All spatial dimensions must be positive")
+
+    def __len__(self) -> int:
+
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+
+        record = self.records[index]
+        image_np, affine = _load_nifti(record.image_path)
+        label_np, label_affine = _load_nifti(record.label_path)
+        _validate_alignment(record, image_np, label_np, affine, label_affine)
+        original_shape = tuple(int(value) for value in image_np.shape)
+
+        # NIfTI is X,Y,Z; PyTorch 3D convention is D,H,W.
+        image = torch.from_numpy(np.ascontiguousarray(image_np.transpose(2, 0, 1))).float()
+        label = torch.from_numpy(np.ascontiguousarray(label_np.transpose(2, 0, 1))).long()
+        image = _normalise_mri(image)
+        image = F.interpolate(
+            image[None, None], size=self.spatial_size, mode="trilinear", align_corners=False
+        )[0]
+        label = F.interpolate(label[None, None].float(), size=self.spatial_size, mode="nearest")[
+            0, 0
+        ].long()
+
+        if self.augment:
+            # Spatial transforms are applied identically to image and mask.
+            # Determine the anatomical left-right voxel axis from the affine.
+            # If it is ambiguous, skip the flip rather than guessing.
+            flip_dims = _left_right_flip_dims(affine)
+            if flip_dims is not None and torch.rand(()) < 0.5:
+                image_dim, label_dim = flip_dims
+                image = torch.flip(image, dims=(image_dim,))
+                label = torch.flip(label, dims=(label_dim,))
+
+            if torch.rand(()) < 0.3:
+                scale = torch.empty(()).uniform_(0.9, 1.1)
+                shift = torch.empty(()).uniform_(-0.1, 0.1)
+                image = image * scale + shift * (image != 0)
+
+        return {
+            "image": image,
+            "label": label,
+            "case_id": record.case_id,
+            "patient_id": record.patient_id,
+            "image_path": record.image_path,
+            "label_path": record.label_path,
+            "affine": torch.from_numpy(np.asarray(affine, dtype=np.float64)),
+            "original_shape": torch.tensor(original_shape, dtype=torch.int64),
+        }
