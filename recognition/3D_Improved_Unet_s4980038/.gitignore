@@ -1,0 +1,16 @@
+# The assignment explicitly prohibits committing datasets and model weights.
+HipMRI_Study_open/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.nii
+*.nii.gz
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.out
+*.err
+*.sh
+*.zip
+tests/

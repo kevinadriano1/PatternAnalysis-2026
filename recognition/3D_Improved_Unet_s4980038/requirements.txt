@@ -1,0 +1,4 @@
+torch==2.13.0+cu130
+numpy==2.4.6
+nibabel==5.4.2
+matplotlib==3.11.1
