@@ -188,3 +188,312 @@ def save_failure_figure(candidate: dict[str, object], output_path: Path) -> None
     figure.tight_layout(rect=(0, 0.07, 1, 0.96))
     figure.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(figure)
+
+
+
+def main() -> None:
+
+    # Parse command line arguments and validate them
+    args = parse_args()
+    if args.failure_count < 1 or args.failure_count > 5:
+        raise ValueError("--failure-count must be between 1 and 5")
+    if args.context_radius < 0:
+        raise ValueError("--context-radius must be non-negative")
+
+    # Parse visualisation specifications and prepare output directories
+    visualisation_specs = _parse_visualisation_specs(args.visualise_case)
+    requested_case_ids = {case_id for case_id, _ in visualisation_specs}
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    prediction_dir = args.output_dir / "nifti_predictions"
+    figure_dir = args.output_dir / "failure_cases"
+    
+    if not args.no_save_nifti:
+        prediction_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    model_name = str(checkpoint["model_name"])
+    
+    if args.expected_model is not None and model_name != args.expected_model:
+        raise ValueError(
+            f"Expected a {args.expected_model} checkpoint, but {args.checkpoint} "
+            f"contains {model_name}"
+        )
+    seed = int(checkpoint.get("seed", 3710))
+    spatial_size = tuple(int(value) for value in checkpoint["spatial_size"])
+
+    # Set random seeds for reproducibility
+    seed_everything(seed)
+
+    # Discover test cases and validate the split manifest
+    records = discover_cases(args.data_root)
+    manifest_path = args.split_manifest or args.checkpoint.parent / "split_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    patient_sets = [{row["patient_id"] for row in manifest[key]["cases"]} for key in ("train", "validation", "test")]
+
+    # Check for patient leakage across splits
+    if any(patient_sets[i] & patient_sets[j] for i in range(3) for j in range(i + 1, 3)):
+        raise ValueError("Patient leakage in saved split manifest")
+    lookup = {record.case_id: record for record in records}
+    saved_test = manifest["test"]["cases"]
+    
+    if not saved_test or len({r["case_id"] for r in saved_test}) != len(saved_test):
+        raise ValueError("Empty or duplicated test cases in manifest")
+    test_records = []
+
+    # Validate that the patient IDs in the manifest match the discovered records
+    for row in saved_test:
+        record = lookup[row["case_id"]]
+        if record.patient_id != row["patient_id"]:
+            raise ValueError(f"Patient mapping changed for {record.case_id}")
+        test_records.append(record)
+    if args.limit_cases is not None:
+        test_records = test_records[: args.limit_cases]
+
+    # Prepare the dataset and data loader for evaluation
+    dataset = HipMRIVolumeDataset(test_records, spatial_size=spatial_size, augment=False)
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.workers > 0,
+    )
+    model = build_model(
+        model_name,
+        num_classes=int(checkpoint["num_classes"]),
+        base_channels=checkpoint.get("base_channels"),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    use_amp = device.type == "cuda" and not args.no_amp
+
+    # Initialize metrics accumulators and prepare for evaluation
+    aggregate = SegmentationMetrics(len(LABEL_NAMES))
+    boundary = BoundaryF1(label=5, tolerance=1)
+    rows: list[dict[str, object]] = []
+    lowest_case_by_patient: dict[str, dict[str, object]] = {}
+    requested_candidates: dict[str, dict[str, object]] = {}
+    latencies: list[float] = []
+    
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    # Evaluate the model on the test dataset and collect metrics
+    with torch.inference_mode():
+        for batch in loader:
+            image = batch["image"].to(device, non_blocking=True)
+            target = batch["label"].to(device, non_blocking=True)
+            prediction, latency_ms = timed_inference(
+                model, image, model_name, args.slice_batch_size, use_amp
+            )
+            latencies.append(latency_ms)
+            aggregate.update(prediction, target)
+            boundary.update(prediction, target)
+
+            case_id = str(batch["case_id"][0])
+            patient_id = str(batch["patient_id"][0])
+            metrics = _case_metrics(prediction, target)
+            regional = regional_prostate_dice(prediction, target, label=5)
+            extent = prostate_extent_metrics(prediction, target)
+            row: dict[str, object] = {
+                "case_id": case_id,
+                "patient_id": patient_id,
+                "latency_ms": latency_ms,
+                **metrics,
+                **regional,
+                **extent,
+            }
+            rows.append(row)
+
+            original_shape = tuple(int(value) for value in batch["original_shape"][0].tolist())
+            affine = batch["affine"][0].numpy()
+            if not args.no_save_nifti:
+                _save_prediction(
+                    prediction[0],
+                    original_shape,
+                    affine,
+                    prediction_dir / f"{case_id}_prediction.nii.gz",
+                )
+            # Store the candidate information for potential failure visualisation
+            candidate = {
+                "case_id": case_id,
+                "patient_id": patient_id,
+                "prostate_dice": metrics["dice_prostate"],
+                "image": image[0, 0].detach().cpu(),
+                "target": target[0].detach().cpu(),
+                "prediction": prediction[0].detach().cpu(),
+                "regional": regional,
+                "extent": extent,
+                "axis_codes": "".join(nib.aff2axcodes(affine)),
+                "context_radius": args.context_radius,
+            }
+            existing = lowest_case_by_patient.get(patient_id)
+            if existing is None or float(candidate["prostate_dice"]) < float(
+                existing["prostate_dice"]
+            ):
+                lowest_case_by_patient[patient_id] = candidate
+            if case_id in requested_case_ids:
+                requested_candidates[case_id] = candidate
+
+    # Write per-case metrics to CSV if any rows were collected
+    if rows:
+        with (args.output_dir / "per_case_metrics.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    missing_requested = sorted(requested_case_ids - requested_candidates.keys())
+    if missing_requested:
+        raise ValueError(
+            "Requested visualisation cases are not in the evaluated test split: "
+            + ", ".join(missing_requested)
+        )
+
+    if visualisation_specs:
+        selected_specs = [
+            (requested_candidates[case_id], slice_index)
+            for case_id, slice_index in visualisation_specs
+        ]
+    else:
+        ranked_candidates = sorted(
+            lowest_case_by_patient.values(),
+            key=lambda item: float(item["prostate_dice"]),
+        )[: args.failure_count]
+        selected_specs = [(candidate, None) for candidate in ranked_candidates]
+
+    figure_records: list[dict[str, object]] = []
+    selected_failure_volumes: list[dict[str, object]] = []
+    selected_volume_ids: set[str] = set()
+    
+    figure_rank = 0
+
+    # Generate failure figures and collect records for the summary
+    for candidate, requested_slice in selected_specs:
+        candidate_case_id = str(candidate["case_id"])
+        if candidate_case_id not in selected_volume_ids:
+            selected_volume_ids.add(candidate_case_id)
+            selected_failure_volumes.append(
+                {
+                    "case_id": candidate_case_id,
+                    "patient_id": candidate["patient_id"],
+                    "whole_volume_prostate_dice": candidate["prostate_dice"],
+                }
+            )
+        regional = candidate["regional"]
+        if not isinstance(regional, dict):
+            raise TypeError("Candidate regional metrics must be a dictionary")
+        if requested_slice is not None:
+            region_slices = [("requested", requested_slice)]
+        else:
+            region_slices = [
+                ("depth-low", regional["prostate_end_low_worst_slice"]),
+                ("central", regional["prostate_centre_worst_slice"]),
+                ("depth-high", regional["prostate_end_high_worst_slice"]),
+            ]
+            if all(slice_index is None for _, slice_index in region_slices):
+                region_slices = [("central fallback", spatial_size[0] // 2)]
+
+        # Track seen slices to avoid duplicate visualisations for the same slice
+        seen_slices: set[int] = set()
+        for region, raw_slice in region_slices:
+            if raw_slice is None:
+                continue
+            slice_index = int(raw_slice)
+            if slice_index < 0 or slice_index >= spatial_size[0]:
+                raise ValueError(
+                    f"Slice {slice_index} for {candidate['case_id']} is outside "
+                    f"the valid range 0..{spatial_size[0] - 1}"
+                )
+            if requested_slice is None and slice_index in seen_slices:
+                continue
+            seen_slices.add(slice_index)
+            target = candidate["target"]
+            prediction = candidate["prediction"]
+            if not isinstance(target, torch.Tensor) or not isinstance(
+                prediction, torch.Tensor
+            ):
+                raise TypeError("Candidate prediction and target must be tensors")
+            figure_candidate = {
+                **candidate,
+                "region": region,
+                "slice_index": slice_index,
+                "slice_dice": dice_for_label(
+                    prediction[slice_index], target[slice_index], label=5
+                ),
+            }
+            figure_rank += 1
+            safe_region = region.replace(" ", "_")
+            save_failure_figure(
+                figure_candidate,
+                figure_dir
+                / (
+                    f"{figure_rank:02d}_{candidate['case_id']}_{safe_region}_"
+                    f"slice_{slice_index}.png"
+                ),
+            )
+            # Record the figure information for the summary JSON
+            figure_records.append(
+                {
+                    "case_id": candidate["case_id"],
+                    "patient_id": candidate["patient_id"],
+                    "region": region,
+                    "gt_first_slice": candidate["extent"]["prostate_gt_first_slice"],
+                    "gt_last_slice": candidate["extent"]["prostate_gt_last_slice"],
+                    "nifti_axis_codes": candidate["axis_codes"],
+                    "context_radius": args.context_radius,
+                    "slice_index": slice_index,
+                    "whole_volume_prostate_dice": candidate["prostate_dice"],
+                    "slice_prostate_dice": figure_candidate["slice_dice"],
+                }
+            )
+
+    # Write a summary JSON file with aggregated metrics and evaluation details
+    summary: dict[str, object] = {
+        "extent_totals": {key: sum(int(row[key]) for row in rows) for key in EXTENT_COUNT_KEYS},
+        "extent_definition": "Downsampled grid counts; below/above mean depth indices. Complete miss means no prostate prediction on a GT-positive slice.",
+        "spatial_size": list(spatial_size),
+        "use_amp": use_amp,
+        "torch_version": str(torch.__version__),
+        "split_manifest": str(manifest_path),
+        "model": model_name,
+        "checkpoint": str(args.checkpoint.resolve()),
+        "test_patients": sorted({record.patient_id for record in test_records}),
+        "test_case_ids": [record.case_id for record in test_records],
+        "test_cases": len(test_records),
+        **aggregate.compute(),
+        **boundary.compute(),
+        "parameters": parameter_count(model),
+        "mean_inference_ms_per_case": float(np.mean(latencies)) if latencies else float("nan"),
+        "peak_inference_gpu_allocated_mib": (
+            torch.cuda.max_memory_allocated(device) / (1024**2)
+            if device.type == "cuda"
+            else 0.0
+        ),
+        "peak_gpu_vram_mb": (
+            torch.cuda.max_memory_allocated(device) / (1024**2) if device.type == "cuda" else 0.0
+        ),
+        "peak_training_gpu_allocated_mib": checkpoint.get(
+            "peak_training_gpu_allocated_mib"
+        ),
+        "device": str(device),
+        "gpu_model": (
+            torch.cuda.get_device_name(device) if device.type == "cuda" else None
+        ),
+        "boundary_tolerance_voxels": 1,
+        "boundary_tolerance_definition": (
+            "Chebyshev distance on the downsampled D,H,W evaluation grid; not millimetres"
+        ),
+        "failure_cases": selected_failure_volumes,
+        "failure_figures": figure_records,
+    }
+    write_json(summary, args.output_dir / "summary.json")
+    print(json.dumps(summary, indent=2), flush=True)
+
+
+if __name__ == "__main__":
+    main()
